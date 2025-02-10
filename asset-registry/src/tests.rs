@@ -1,17 +1,23 @@
 #![cfg(test)]
 
-use super::*;
+use super::mock;
 use crate as orml_asset_registry;
-use crate::tests::para::{AdminAssetTwo, AssetRegistry, CustomMetadata, Origin, Tokens, TreasuryAccount};
-use frame_support::{assert_noop, assert_ok};
-use mock::{para::Call, *};
+use crate::{
+	tests::para::{AdminAssetTwo, AssetRegistry, CustomMetadata, RuntimeOrigin, Tokens, TreasuryAccount},
+	Error, LastAssetId, Metadata,
+};
+use frame_support::{assert_noop, assert_ok, pallet_prelude::*};
+use mock::{para::RuntimeCall, *};
+use orml_traits::asset_registry::AssetMetadata;
 use orml_traits::MultiCurrency;
-use polkadot_parachain::primitives::Sibling;
+use polkadot_parachain_primitives::primitives::Sibling;
+use scale_info::TypeInfo;
 
 use sp_runtime::{
 	traits::{AccountIdConversion, BadOrigin, Dispatchable},
 	AccountId32,
 };
+use xcm::{v3, v5::prelude::*, VersionedLocation};
 use xcm_simulator::TestExt;
 
 fn treasury_account() -> AccountId32 {
@@ -40,17 +46,57 @@ fn print_events<Runtime: frame_system::Config>(name: &'static str) {
 		.for_each(|r| println!("> {:?}", r.event));
 }
 
-fn dummy_metadata() -> AssetMetadata<<para::Runtime as orml_asset_registry::Config>::Balance, CustomMetadata> {
+fn dummy_metadata() -> AssetMetadata<
+	<para::Runtime as orml_asset_registry::Config>::Balance,
+	CustomMetadata,
+	<para::Runtime as orml_asset_registry::Config>::StringLimit,
+> {
+	let loc: VersionedLocation = Location::new(
+		1,
+		[Parachain(1), Junction::from(BoundedVec::try_from(vec![0]).unwrap())],
+	)
+	.into();
 	AssetMetadata {
 		decimals: 12,
-		name: "para A native token".as_bytes().to_vec(),
-		symbol: "paraA".as_bytes().to_vec(),
+		name: BoundedVec::truncate_from("para A native token".as_bytes().to_vec()),
+		symbol: BoundedVec::truncate_from("paraA".as_bytes().to_vec()),
 		existential_deposit: 0,
-		location: Some(MultiLocation::new(1, X2(Parachain(1), GeneralKey(vec![0].try_into().unwrap()))).into()),
+		location: Some(loc),
 		additional: CustomMetadata {
 			fee_per_second: 1_000_000_000_000,
 		},
 	}
+}
+
+#[test]
+fn genesis_issuance_should_work() {
+	TestNet::reset();
+
+	ParaG::execute_with(|| {
+		let metadata1 = AssetMetadata {
+			decimals: 12,
+			name: BoundedVec::truncate_from("para G native token".as_bytes().to_vec()),
+			symbol: BoundedVec::truncate_from("paraG".as_bytes().to_vec()),
+			existential_deposit: 0,
+			location: None,
+			additional: CustomMetadata {
+				fee_per_second: 1_000_000_000_000,
+			},
+		};
+		let metadata2 = AssetMetadata {
+			decimals: 12,
+			name: BoundedVec::truncate_from("para G foreign token".as_bytes().to_vec()),
+			symbol: BoundedVec::truncate_from("paraF".as_bytes().to_vec()),
+			existential_deposit: 0,
+			location: None,
+			additional: CustomMetadata {
+				fee_per_second: 1_000_000_000_000,
+			},
+		};
+		assert_eq!(AssetRegistry::metadata(4).unwrap(), metadata1);
+		assert_eq!(AssetRegistry::metadata(5).unwrap(), metadata2);
+		assert_eq!(LastAssetId::<para::Runtime>::get(), 5);
+	});
 }
 
 #[test]
@@ -61,12 +107,15 @@ fn send_self_parachain_asset_to_sibling() {
 	let mut metadata = dummy_metadata();
 
 	ParaB::execute_with(|| {
-		AssetRegistry::register_asset(Origin::root(), metadata.clone(), None).unwrap();
+		AssetRegistry::register_asset(RuntimeOrigin::root(), metadata.clone(), None).unwrap();
 	});
 
 	ParaA::execute_with(|| {
-		metadata.location = Some(MultiLocation::new(0, X1(GeneralKey(vec![0].try_into().unwrap()))).into());
-		AssetRegistry::register_asset(Origin::root(), metadata, None).unwrap();
+		metadata.location = Some(Into::<VersionedLocation>::into(Location::new(
+			0,
+			[Junction::from(BoundedVec::try_from(vec![0]).unwrap())],
+		)));
+		AssetRegistry::register_asset(RuntimeOrigin::root(), metadata, None).unwrap();
 
 		assert_ok!(ParaTokens::deposit(CurrencyId::RegisteredAsset(1), &ALICE, 1_000));
 
@@ -75,19 +124,19 @@ fn send_self_parachain_asset_to_sibling() {
 			CurrencyId::RegisteredAsset(1),
 			500,
 			Box::new(
-				MultiLocation::new(
+				Location::new(
 					1,
-					X2(
+					[
 						Parachain(2),
 						Junction::AccountId32 {
-							network: NetworkId::Any,
+							network: None,
 							id: BOB.into(),
 						}
-					)
+					]
 				)
 				.into()
 			),
-			40,
+			WeightLimit::Unlimited,
 		));
 
 		assert_eq!(ParaTokens::free_balance(CurrencyId::RegisteredAsset(1), &ALICE), 500);
@@ -115,9 +164,15 @@ fn send_sibling_asset_to_non_reserve_sibling() {
 
 	ParaA::execute_with(|| {
 		AssetRegistry::register_asset(
-			Origin::root(),
+			RuntimeOrigin::root(),
 			AssetMetadata {
-				location: Some(MultiLocation::new(1, X2(Parachain(2), GeneralKey(vec![0].try_into().unwrap()))).into()),
+				location: Some(
+					Location::new(
+						1,
+						[Parachain(2), Junction::from(BoundedVec::try_from(vec![0]).unwrap())],
+					)
+					.into(),
+				),
 				..dummy_metadata()
 			},
 			None,
@@ -128,9 +183,9 @@ fn send_sibling_asset_to_non_reserve_sibling() {
 
 	ParaB::execute_with(|| {
 		AssetRegistry::register_asset(
-			Origin::root(),
+			RuntimeOrigin::root(),
 			AssetMetadata {
-				location: Some(MultiLocation::new(0, X1(GeneralKey(vec![0].try_into().unwrap()))).into()),
+				location: Some(Location::new(0, [Junction::from(BoundedVec::try_from(vec![0]).unwrap())]).into()),
 				..dummy_metadata()
 			},
 			None,
@@ -145,9 +200,15 @@ fn send_sibling_asset_to_non_reserve_sibling() {
 
 	ParaC::execute_with(|| {
 		AssetRegistry::register_asset(
-			Origin::root(),
+			RuntimeOrigin::root(),
 			AssetMetadata {
-				location: Some(MultiLocation::new(1, X2(Parachain(2), GeneralKey(vec![0].try_into().unwrap()))).into()),
+				location: Some(
+					Location::new(
+						1,
+						[Parachain(2), Junction::from(BoundedVec::try_from(vec![0]).unwrap())],
+					)
+					.into(),
+				),
 				..dummy_metadata()
 			},
 			None,
@@ -161,19 +222,19 @@ fn send_sibling_asset_to_non_reserve_sibling() {
 			CurrencyId::RegisteredAsset(1),
 			500,
 			Box::new(
-				MultiLocation::new(
+				Location::new(
 					1,
-					X2(
+					[
 						Parachain(3),
 						Junction::AccountId32 {
-							network: NetworkId::Any,
+							network: None,
 							id: BOB.into(),
 						}
-					)
+					]
 				)
 				.into()
 			),
-			40
+			WeightLimit::Unlimited
 		));
 		assert_eq!(ParaTokens::free_balance(CurrencyId::RegisteredAsset(1), &ALICE), 500);
 	});
@@ -204,13 +265,19 @@ fn test_sequential_id_normal_behavior() {
 		let metadata1 = dummy_metadata();
 
 		let metadata2 = AssetMetadata {
-			name: "para A native token 2".as_bytes().to_vec(),
-			symbol: "paraA2".as_bytes().to_vec(),
-			location: Some(MultiLocation::new(1, X2(Parachain(1), GeneralKey(vec![1].try_into().unwrap()))).into()),
+			name: BoundedVec::truncate_from("para A native token 2".as_bytes().to_vec()),
+			symbol: BoundedVec::truncate_from("paraA2".as_bytes().to_vec()),
+			location: Some(
+				Location::new(
+					1,
+					[Parachain(1), Junction::from(BoundedVec::try_from(vec![1]).unwrap())],
+				)
+				.into(),
+			),
 			..dummy_metadata()
 		};
-		AssetRegistry::register_asset(Origin::root(), metadata1.clone(), None).unwrap();
-		AssetRegistry::register_asset(Origin::root(), metadata2.clone(), None).unwrap();
+		AssetRegistry::register_asset(RuntimeOrigin::root(), metadata1.clone(), None).unwrap();
+		AssetRegistry::register_asset(RuntimeOrigin::root(), metadata2.clone(), None).unwrap();
 
 		assert_eq!(AssetRegistry::metadata(1).unwrap(), metadata1);
 		assert_eq!(AssetRegistry::metadata(2).unwrap(), metadata2);
@@ -222,9 +289,13 @@ fn test_sequential_id_with_invalid_id_returns_error() {
 	TestNet::reset();
 
 	ParaA::execute_with(|| {
-		assert_ok!(AssetRegistry::register_asset(Origin::root(), dummy_metadata(), Some(1)));
+		assert_ok!(AssetRegistry::register_asset(
+			RuntimeOrigin::root(),
+			dummy_metadata(),
+			Some(1)
+		));
 		assert_noop!(
-			AssetRegistry::register_asset(Origin::root(), dummy_metadata(), Some(1)),
+			AssetRegistry::register_asset(RuntimeOrigin::root(), dummy_metadata(), Some(1)),
 			Error::<para::Runtime>::InvalidAssetId
 		);
 	});
@@ -238,15 +309,15 @@ fn test_fixed_rate_asset_trader() {
 	let metadata = dummy_metadata();
 
 	ParaB::execute_with(|| {
-		AssetRegistry::register_asset(Origin::root(), metadata.clone(), None).unwrap();
+		AssetRegistry::register_asset(RuntimeOrigin::root(), metadata.clone(), None).unwrap();
 	});
 
 	ParaA::execute_with(|| {
 		let para_a_metadata = AssetMetadata {
-			location: Some(MultiLocation::new(0, X1(GeneralKey(vec![0].try_into().unwrap()))).into()),
+			location: Some(Location::new(0, [Junction::from(BoundedVec::try_from(vec![0]).unwrap())]).into()),
 			..metadata.clone()
 		};
-		AssetRegistry::register_asset(Origin::root(), para_a_metadata, None).unwrap();
+		AssetRegistry::register_asset(RuntimeOrigin::root(), para_a_metadata, None).unwrap();
 
 		assert_ok!(ParaTokens::deposit(CurrencyId::RegisteredAsset(1), &ALICE, 1_000));
 
@@ -255,19 +326,19 @@ fn test_fixed_rate_asset_trader() {
 			CurrencyId::RegisteredAsset(1),
 			500,
 			Box::new(
-				MultiLocation::new(
+				Location::new(
 					1,
-					X2(
+					[
 						Parachain(2),
 						Junction::AccountId32 {
-							network: NetworkId::Any,
+							network: None,
 							id: BOB.into(),
 						}
-					)
+					]
 				)
 				.into()
 			),
-			40,
+			WeightLimit::Unlimited,
 		));
 	});
 
@@ -286,7 +357,7 @@ fn test_fixed_rate_asset_trader() {
 
 		// now double the fee rate
 		AssetRegistry::update_asset(
-			Origin::root(),
+			RuntimeOrigin::root(),
 			1,
 			None,
 			None,
@@ -306,19 +377,19 @@ fn test_fixed_rate_asset_trader() {
 			CurrencyId::RegisteredAsset(1),
 			500,
 			Box::new(
-				MultiLocation::new(
+				Location::new(
 					1,
-					X2(
+					[
 						Parachain(2),
 						Junction::AccountId32 {
-							network: NetworkId::Any,
+							network: None,
 							id: BOB.into(),
 						}
-					)
+					]
 				)
 				.into()
 			),
-			40,
+			WeightLimit::Unlimited,
 		));
 	});
 
@@ -345,13 +416,17 @@ fn test_register_duplicate_location_returns_error() {
 	ParaA::execute_with(|| {
 		let metadata = dummy_metadata();
 
-		assert_ok!(AssetRegistry::register_asset(Origin::root(), metadata.clone(), None));
-		let register_asset = Call::AssetRegistry(crate::Call::<para::Runtime>::register_asset {
-			metadata: metadata.clone(),
+		assert_ok!(AssetRegistry::register_asset(
+			RuntimeOrigin::root(),
+			metadata.clone(),
+			None
+		));
+		let register_asset = RuntimeCall::AssetRegistry(crate::Call::<para::Runtime>::register_asset {
+			metadata,
 			asset_id: None,
 		});
 		assert_noop!(
-			register_asset.dispatch(Origin::root()),
+			register_asset.dispatch(RuntimeOrigin::root()),
 			Error::<para::Runtime>::ConflictingLocation
 		);
 	});
@@ -362,7 +437,11 @@ fn test_register_duplicate_asset_id_returns_error() {
 	TestNet::reset();
 
 	ParaA::execute_with(|| {
-		assert_ok!(AssetRegistry::register_asset(Origin::root(), dummy_metadata(), Some(1)));
+		assert_ok!(AssetRegistry::register_asset(
+			RuntimeOrigin::root(),
+			dummy_metadata(),
+			Some(1)
+		));
 		assert_noop!(
 			AssetRegistry::do_register_asset_without_asset_processor(dummy_metadata(), 1),
 			Error::<para::Runtime>::ConflictingAssetId
@@ -377,23 +456,29 @@ fn test_update_metadata_works() {
 	ParaA::execute_with(|| {
 		let old_metadata = dummy_metadata();
 		assert_ok!(AssetRegistry::register_asset(
-			Origin::root(),
+			RuntimeOrigin::root(),
 			old_metadata.clone(),
 			None
 		));
 
 		let new_metadata = AssetMetadata {
 			decimals: 11,
-			name: "para A native token2".as_bytes().to_vec(),
-			symbol: "paraA2".as_bytes().to_vec(),
+			name: BoundedVec::truncate_from("para A native token2".as_bytes().to_vec()),
+			symbol: BoundedVec::truncate_from("paraA2".as_bytes().to_vec()),
 			existential_deposit: 1,
-			location: Some(MultiLocation::new(1, X2(Parachain(1), GeneralKey(vec![1].try_into().unwrap()))).into()),
+			location: Some(
+				Location::new(
+					1,
+					[Parachain(1), Junction::from(BoundedVec::try_from(vec![1]).unwrap())],
+				)
+				.into(),
+			),
 			additional: CustomMetadata {
 				fee_per_second: 2_000_000_000_000,
 			},
 		};
 		assert_ok!(AssetRegistry::update_asset(
-			Origin::root(),
+			RuntimeOrigin::root(),
 			1,
 			Some(new_metadata.decimals),
 			Some(new_metadata.name.clone()),
@@ -403,8 +488,8 @@ fn test_update_metadata_works() {
 			Some(new_metadata.additional.clone())
 		));
 
-		let old_location: MultiLocation = old_metadata.location.clone().unwrap().try_into().unwrap();
-		let new_location: MultiLocation = new_metadata.location.clone().unwrap().try_into().unwrap();
+		let old_location: v3::Location = old_metadata.location.unwrap().try_into().unwrap();
+		let new_location: v3::Location = new_metadata.location.clone().unwrap().try_into().unwrap();
 
 		// check that the old location was removed and the new one added
 		assert_eq!(AssetRegistry::location_to_asset_id(old_location), None);
@@ -420,14 +505,10 @@ fn test_update_metadata_fails_with_unknown_asset() {
 
 	ParaA::execute_with(|| {
 		let old_metadata = dummy_metadata();
-		assert_ok!(AssetRegistry::register_asset(
-			Origin::root(),
-			old_metadata.clone(),
-			None
-		));
+		assert_ok!(AssetRegistry::register_asset(RuntimeOrigin::root(), old_metadata, None));
 
 		assert_noop!(
-			AssetRegistry::update_asset(Origin::root(), 4, None, None, None, None, None, None,),
+			AssetRegistry::update_asset(RuntimeOrigin::root(), 4, None, None, None, None, None, None,),
 			Error::<para::Runtime>::AssetNotFound
 		);
 	});
@@ -442,10 +523,10 @@ fn test_existential_deposits() {
 			existential_deposit: 100,
 			..dummy_metadata()
 		};
-		assert_ok!(AssetRegistry::register_asset(Origin::root(), metadata, None));
+		assert_ok!(AssetRegistry::register_asset(RuntimeOrigin::root(), metadata, None));
 
 		assert_ok!(Tokens::set_balance(
-			Origin::root(),
+			RuntimeOrigin::root(),
 			ALICE,
 			CurrencyId::RegisteredAsset(1),
 			1_000,
@@ -475,7 +556,7 @@ fn test_asset_authority() {
 		let metadata = dummy_metadata();
 
 		// Assert that root can register an asset with id 1
-		assert_ok!(AssetRegistry::register_asset(Origin::root(), metadata.clone(), Some(1)));
+		assert_ok!(AssetRegistry::register_asset(RuntimeOrigin::root(), metadata, Some(1)));
 
 		// Assert that only Account42 can register asset with id 42
 		let metadata = AssetMetadata {
@@ -485,14 +566,69 @@ fn test_asset_authority() {
 
 		// It fails when signed with root...
 		assert_noop!(
-			AssetRegistry::register_asset(Origin::root(), metadata.clone(), Some(2)),
+			AssetRegistry::register_asset(RuntimeOrigin::root(), metadata.clone(), Some(2)),
 			BadOrigin
 		);
 		// It works when signed with the right account
 		assert_ok!(AssetRegistry::register_asset(
-			Origin::signed(AdminAssetTwo::get()),
+			RuntimeOrigin::signed(AdminAssetTwo::get()),
 			metadata,
 			Some(2)
 		));
+	});
+}
+
+#[test]
+fn test_decode_bounded_vec() {
+	TestNet::reset();
+
+	pub mod unbounded {
+		use super::*;
+
+		#[frame_support::storage_alias]
+		pub type Metadata<T: orml_asset_registry::Config> = StorageMap<
+			orml_asset_registry::Pallet<T>,
+			Twox64Concat,
+			<T as orml_asset_registry::Config>::AssetId,
+			AssetMetadata<
+				<T as orml_asset_registry::Config>::Balance,
+				<T as orml_asset_registry::Config>::CustomMetadata,
+			>,
+			OptionQuery,
+		>;
+
+		#[derive(TypeInfo, Encode, Decode, Clone, Eq, PartialEq, RuntimeDebug)]
+		pub struct AssetMetadata<Balance, CustomMetadata: Parameter + Member + TypeInfo> {
+			pub decimals: u32,
+			pub name: Vec<u8>,
+			pub symbol: Vec<u8>,
+			pub existential_deposit: Balance,
+			pub location: Option<VersionedLocation>,
+			pub additional: CustomMetadata,
+		}
+	}
+
+	ParaA::execute_with(|| {
+		let para_name = "para A native token".as_bytes().to_vec();
+		let para_symbol = "paraA".as_bytes().to_vec();
+		unbounded::Metadata::<para::Runtime>::insert(
+			0,
+			unbounded::AssetMetadata {
+				decimals: 12,
+				name: para_name.clone(),
+				symbol: para_symbol.clone(),
+				existential_deposit: 0,
+				location: None,
+				additional: CustomMetadata {
+					fee_per_second: 1_000_000_000_000,
+				},
+			},
+		);
+
+		let asset_metadata = Metadata::<para::Runtime>::get(0);
+		assert_eq!(
+			asset_metadata.map(|m| (m.name.to_vec(), m.symbol.to_vec())),
+			Some((para_name, para_symbol))
+		);
 	});
 }

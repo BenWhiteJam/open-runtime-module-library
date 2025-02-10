@@ -3,7 +3,7 @@
 
 use frame_support::pallet_prelude::*;
 use sp_std::vec::Vec;
-use xcm::latest::prelude::*;
+use xcm::v5::prelude::*;
 
 use orml_xcm_support::UnknownAsset;
 
@@ -18,16 +18,16 @@ pub mod module {
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
-		type Event: From<Event> + IsType<<Self as frame_system::Config>::Event>;
+		type RuntimeEvent: From<Event> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 	}
 
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(crate) fn deposit_event)]
 	pub enum Event {
 		/// Deposit success.
-		Deposited { asset: MultiAsset, who: MultiLocation },
+		Deposited { asset: Asset, who: Location },
 		/// Withdraw success.
-		Withdrawn { asset: MultiAsset, who: MultiLocation },
+		Withdrawn { asset: Asset, who: Location },
 	}
 
 	#[pallet::error]
@@ -40,13 +40,12 @@ pub mod module {
 		UnhandledAsset,
 	}
 
+	const STORAGE_VERSION: StorageVersion = StorageVersion::new(2);
+
 	#[pallet::pallet]
-	#[pallet::generate_store(pub(super) trait Store)]
+	#[pallet::storage_version(STORAGE_VERSION)]
 	#[pallet::without_storage_info]
 	pub struct Pallet<T>(_);
-
-	#[pallet::hooks]
-	impl<T: Config> Hooks<T::BlockNumber> for Pallet<T> {}
 
 	/// Concrete fungible balances under a given location and a concrete
 	/// fungible id.
@@ -55,7 +54,7 @@ pub mod module {
 	#[pallet::storage]
 	#[pallet::getter(fn concrete_fungible_balances)]
 	pub(crate) type ConcreteFungibleBalances<T> =
-		StorageDoubleMap<_, Blake2_128Concat, MultiLocation, Blake2_128Concat, MultiLocation, u128, ValueQuery>;
+		StorageDoubleMap<_, Blake2_128Concat, Location, Blake2_128Concat, Location, u128, ValueQuery>;
 
 	/// Abstract fungible balances under a given location and a abstract
 	/// fungible id.
@@ -64,26 +63,16 @@ pub mod module {
 	#[pallet::storage]
 	#[pallet::getter(fn abstract_fungible_balances)]
 	pub(crate) type AbstractFungibleBalances<T> =
-		StorageDoubleMap<_, Blake2_128Concat, MultiLocation, Blake2_128Concat, Vec<u8>, u128, ValueQuery>;
-
-	#[pallet::call]
-	impl<T: Config> Pallet<T> {}
+		StorageDoubleMap<_, Blake2_128Concat, Location, Blake2_128Concat, Vec<u8>, u128, ValueQuery>;
 }
 
 impl<T: Config> UnknownAsset for Pallet<T> {
-	fn deposit(asset: &MultiAsset, to: &MultiLocation) -> DispatchResult {
+	fn deposit(asset: &Asset, to: &Location) -> DispatchResult {
 		match asset {
-			MultiAsset {
+			Asset {
 				fun: Fungible(amount),
-				id: Concrete(location),
+				id: AssetId(location),
 			} => ConcreteFungibleBalances::<T>::try_mutate(to, location, |b| -> DispatchResult {
-				*b = b.checked_add(*amount).ok_or(Error::<T>::BalanceOverflow)?;
-				Ok(())
-			}),
-			MultiAsset {
-				fun: Fungible(amount),
-				id: Abstract(key),
-			} => AbstractFungibleBalances::<T>::try_mutate(to, key, |b| -> DispatchResult {
 				*b = b.checked_add(*amount).ok_or(Error::<T>::BalanceOverflow)?;
 				Ok(())
 			}),
@@ -98,19 +87,12 @@ impl<T: Config> UnknownAsset for Pallet<T> {
 		Ok(())
 	}
 
-	fn withdraw(asset: &MultiAsset, from: &MultiLocation) -> DispatchResult {
+	fn withdraw(asset: &Asset, from: &Location) -> DispatchResult {
 		match asset {
-			MultiAsset {
+			Asset {
 				fun: Fungible(amount),
-				id: Concrete(location),
+				id: AssetId(location),
 			} => ConcreteFungibleBalances::<T>::try_mutate(from, location, |b| -> DispatchResult {
-				*b = b.checked_sub(*amount).ok_or(Error::<T>::BalanceTooLow)?;
-				Ok(())
-			}),
-			MultiAsset {
-				fun: Fungible(amount),
-				id: Abstract(key),
-			} => AbstractFungibleBalances::<T>::try_mutate(from, key, |b| -> DispatchResult {
 				*b = b.checked_sub(*amount).ok_or(Error::<T>::BalanceTooLow)?;
 				Ok(())
 			}),
