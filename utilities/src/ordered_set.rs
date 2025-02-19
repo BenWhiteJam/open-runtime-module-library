@@ -1,5 +1,5 @@
-use codec::{Decode, Encode, MaxEncodedLen};
 use frame_support::{traits::Get, BoundedVec, CloneNoBound, DefaultNoBound, PartialEqNoBound};
+use parity_scale_codec::{Decode, Encode, MaxEncodedLen};
 use scale_info::TypeInfo;
 #[cfg(feature = "std")]
 use sp_std::{fmt, prelude::*};
@@ -25,7 +25,7 @@ impl<T: Ord + Encode + Decode + MaxEncodedLen + Clone + Eq + PartialEq, S: Get<u
 		v.sort();
 		v.dedup();
 
-		Self::from_sorted_set(v.try_into().expect("Did not add any values"))
+		Self::from_sorted_set(v.try_into().map_err(|_| ()).expect("Did not add any values"))
 	}
 
 	/// Create a set from a `Vec`.
@@ -92,9 +92,9 @@ mod tests {
 	use sp_runtime::RuntimeDebug;
 
 	parameter_types! {
-		#[derive(PartialEq, RuntimeDebug)]
+		#[derive(PartialEq, Eq, RuntimeDebug)]
 		pub const Eight: u32 = 8;
-		#[derive(PartialEq, RuntimeDebug)]
+		#[derive(PartialEq, Eq, RuntimeDebug)]
 		pub const Five: u32 = 5;
 	}
 

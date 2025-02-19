@@ -19,16 +19,17 @@
 #![allow(clippy::string_lit_as_bytes)]
 #![allow(clippy::unused_unit)]
 
-use codec::{Decode, Encode, MaxEncodedLen};
+use parity_scale_codec::{Decode, Encode, MaxEncodedLen};
 
 #[cfg(feature = "std")]
 use serde::{Deserialize, Serialize};
 
 use frame_support::{
+	dispatch::Pays,
 	ensure,
 	pallet_prelude::*,
 	traits::{ChangeMembers, Get, SortedMembers, Time},
-	weights::{Pays, Weight},
+	weights::Weight,
 	Parameter,
 };
 use frame_system::{ensure_root, ensure_signed, pallet_prelude::*};
@@ -40,6 +41,9 @@ use sp_std::{prelude::*, vec};
 
 pub use crate::default_combine_data::DefaultCombineData;
 
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+
 mod default_combine_data;
 mod mock;
 mod tests;
@@ -47,6 +51,24 @@ mod weights;
 
 pub use module::*;
 pub use weights::WeightInfo;
+
+#[cfg(feature = "runtime-benchmarks")]
+/// Helper trait for benchmarking.
+pub trait BenchmarkHelper<OracleKey, OracleValue, L: Get<u32>> {
+	/// Returns a list of `(oracle_key, oracle_value)` pairs to be used for
+	/// benchmarking.
+	///
+	/// NOTE: User should ensure to at least submit two values, otherwise the
+	/// benchmark linear analysis might fail.
+	fn get_currency_id_value_pairs() -> BoundedVec<(OracleKey, OracleValue), L>;
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+impl<OracleKey, OracleValue, L: Get<u32>> BenchmarkHelper<OracleKey, OracleValue, L> for () {
+	fn get_currency_id_value_pairs() -> BoundedVec<(OracleKey, OracleValue), L> {
+		BoundedVec::default()
+	}
+}
 
 #[frame_support::pallet]
 pub mod module {
@@ -64,7 +86,7 @@ pub mod module {
 
 	#[pallet::config]
 	pub trait Config<I: 'static = ()>: frame_system::Config {
-		type Event: From<Event<Self, I>> + IsType<<Self as frame_system::Config>::Event>;
+		type RuntimeEvent: From<Event<Self, I>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
 		/// Hook on new data received
 		type OnNewData: OnNewData<Self::AccountId, Self::OracleKey, Self::OracleValue>;
@@ -95,6 +117,13 @@ pub mod module {
 		/// Maximum size of HasDispatched
 		#[pallet::constant]
 		type MaxHasDispatchedSize: Get<u32>;
+
+		/// Maximum size the vector used for feed values
+		#[pallet::constant]
+		type MaxFeedValues: Get<u32>;
+
+		#[cfg(feature = "runtime-benchmarks")]
+		type BenchmarkHelper: BenchmarkHelper<Self::OracleKey, Self::OracleValue, Self::MaxFeedValues>;
 	}
 
 	#[pallet::error]
@@ -133,17 +162,16 @@ pub mod module {
 		StorageValue<_, OrderedSet<T::AccountId, T::MaxHasDispatchedSize>, ValueQuery>;
 
 	#[pallet::pallet]
-	#[pallet::generate_store(pub(super) trait Store)]
 	pub struct Pallet<T, I = ()>(PhantomData<(T, I)>);
 
 	#[pallet::hooks]
-	impl<T: Config<I>, I: 'static> Hooks<T::BlockNumber> for Pallet<T, I> {
+	impl<T: Config<I>, I: 'static> Hooks<BlockNumberFor<T>> for Pallet<T, I> {
 		/// `on_initialize` to return the weight used in `on_finalize`.
-		fn on_initialize(_n: T::BlockNumber) -> Weight {
+		fn on_initialize(_n: BlockNumberFor<T>) -> Weight {
 			T::WeightInfo::on_finalize()
 		}
 
-		fn on_finalize(_n: T::BlockNumber) {
+		fn on_finalize(_n: BlockNumberFor<T>) {
 			// cleanup for next block
 			<HasDispatched<T, I>>::kill();
 		}
@@ -154,15 +182,25 @@ pub mod module {
 		/// Feed the external value.
 		///
 		/// Require authorized operator.
+		#[pallet::call_index(0)]
 		#[pallet::weight(T::WeightInfo::feed_values(values.len() as u32))]
 		pub fn feed_values(
 			origin: OriginFor<T>,
-			values: Vec<(T::OracleKey, T::OracleValue)>,
+			values: BoundedVec<(T::OracleKey, T::OracleValue), T::MaxFeedValues>,
 		) -> DispatchResultWithPostInfo {
 			let feeder = ensure_signed(origin.clone())
 				.map(Some)
 				.or_else(|_| ensure_root(origin).map(|_| None))?;
-			Self::do_feed_values(feeder, values)?;
+
+			let who = Self::ensure_account(feeder)?;
+
+			// ensure account hasn't dispatched an updated yet
+			ensure!(
+				HasDispatched::<T, I>::mutate(|set| set.insert(who.clone())),
+				Error::<T, I>::AlreadyFeeded
+			);
+
+			Self::do_feed_values(who, values.into())?;
 			Ok(Pays::No.into())
 		}
 	}
@@ -172,7 +210,7 @@ impl<T: Config<I>, I: 'static> Pallet<T, I> {
 	pub fn read_raw_values(key: &T::OracleKey) -> Vec<TimestampedValueOf<T, I>> {
 		T::Members::sorted_members()
 			.iter()
-			.chain(vec![T::RootOperatorAccountId::get()].iter())
+			.chain([T::RootOperatorAccountId::get()].iter())
 			.filter_map(|x| Self::raw_values(x, key))
 			.collect()
 	}
@@ -192,28 +230,24 @@ impl<T: Config<I>, I: 'static> Pallet<T, I> {
 		T::CombineData::combine_data(key, values, Self::values(key))
 	}
 
-	fn do_feed_values(who: Option<T::AccountId>, values: Vec<(T::OracleKey, T::OracleValue)>) -> DispatchResult {
+	fn ensure_account(who: Option<T::AccountId>) -> Result<T::AccountId, DispatchError> {
 		// ensure feeder is authorized
-		let who = if let Some(who) = who {
+		if let Some(who) = who {
 			ensure!(T::Members::contains(&who), Error::<T, I>::NoPermission);
-			who
+			Ok(who)
 		} else {
-			T::RootOperatorAccountId::get()
-		};
+			Ok(T::RootOperatorAccountId::get())
+		}
+	}
 
-		// ensure account hasn't dispatched an updated yet
-		ensure!(
-			HasDispatched::<T, I>::mutate(|set| set.insert(who.clone())),
-			Error::<T, I>::AlreadyFeeded
-		);
-
+	fn do_feed_values(who: T::AccountId, values: Vec<(T::OracleKey, T::OracleValue)>) -> DispatchResult {
 		let now = T::Time::now();
 		for (key, value) in &values {
 			let timestamped = TimestampedValue {
 				value: value.clone(),
 				timestamp: now,
 			};
-			RawValues::<T, I>::insert(&who, &key, timestamped);
+			RawValues::<T, I>::insert(&who, key, timestamped);
 
 			// Update `Values` storage if `combined` yielded result.
 			if let Some(combined) = Self::combined(key) {
@@ -257,7 +291,7 @@ impl<T: Config<I>, I: 'static> DataProviderExtended<T::OracleKey, TimestampedVal
 }
 
 impl<T: Config<I>, I: 'static> DataFeeder<T::OracleKey, T::OracleValue, T::AccountId> for Pallet<T, I> {
-	fn feed_value(who: T::AccountId, key: T::OracleKey, value: T::OracleValue) -> DispatchResult {
-		Self::do_feed_values(Some(who), vec![(key, value)])
+	fn feed_value(who: Option<T::AccountId>, key: T::OracleKey, value: T::OracleValue) -> DispatchResult {
+		Self::do_feed_values(Self::ensure_account(who)?, vec![(key, value)])
 	}
 }

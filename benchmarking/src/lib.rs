@@ -7,8 +7,14 @@ mod tests;
 
 pub use frame_benchmarking::{
 	benchmarking, whitelisted_caller, BenchmarkBatch, BenchmarkConfig, BenchmarkError, BenchmarkList,
-	BenchmarkMetadata, BenchmarkParameter, BenchmarkResult, Benchmarking, BenchmarkingSetup,
+	BenchmarkMetadata, BenchmarkParameter, BenchmarkRecording, BenchmarkResult, Benchmarking, BenchmarkingSetup,
+	Recording,
 };
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::{format, string::String};
 #[cfg(feature = "std")]
 pub use frame_benchmarking::{Analysis, BenchmarkSelector};
 #[doc(hidden)]
@@ -16,7 +22,11 @@ pub use frame_support;
 #[doc(hidden)]
 pub use log;
 #[doc(hidden)]
+pub use parity_scale_codec;
+#[doc(hidden)]
 pub use paste;
+#[doc(hidden)]
+pub use sp_core::defer;
 #[doc(hidden)]
 pub use sp_io::storage::root as storage_root;
 #[doc(hidden)]
@@ -70,7 +80,7 @@ macro_rules! whitelist_account {
 /// benchmark. Using the simple syntax, the associated dispatchable function
 /// maps 1:1 with the benchmark and the name of the benchmark is the same as
 /// that of the associated function. However, extended syntax allows
-/// for arbitrary expresions to be evaluated in a benchmark (including for
+/// for arbitrary expression to be evaluated in a benchmark (including for
 /// example, `on_initialize`).
 ///
 /// Note that the ranges are *inclusive* on both sides. This is in contrast to
@@ -99,14 +109,14 @@ macro_rules! whitelist_account {
 ///   foo {
 ///     let caller = account::<AccountId>(b"caller", 0, benchmarks_seed);
 ///     let l in 1 .. MAX_LENGTH => initialize_l(l);
-///   }: _(Origin::Signed(caller), vec![0u8; l])
+///   }: _(RuntimeOrigin::signed(caller), vec![0u8; l])
 ///
 ///   // second dispatchable: bar; this is a root dispatchable and accepts a `u8` vector of size
 ///   // `l`.
 ///   // In this case, we explicitly name the call using `bar` instead of `_`.
 ///   bar {
 ///     let l in 1 .. MAX_LENGTH => initialize_l(l);
-///   }: bar(Origin::Root, vec![0u8; l])
+///   }: bar(RuntimeOrigin::root, vec![0u8; l])
 ///
 ///   // third dispatchable: baz; this is a user dispatchable. It isn't dependent on length like the
 ///   // other two but has its own complexity `c` that needs setting up. It uses `caller` (in the
@@ -115,13 +125,13 @@ macro_rules! whitelist_account {
 ///   baz1 {
 ///     let caller = account::<AccountId>(b"caller", 0, benchmarks_seed);
 ///     let c = 0 .. 10 => setup_c(&caller, c);
-///   }: baz(Origin::Signed(caller))
+///   }: baz(RuntimeOrigin::signed(caller))
 ///
 ///   // this is a second benchmark of the baz dispatchable with a different setup.
 ///   baz2 {
 ///     let caller = account::<AccountId>(b"caller", 0, benchmarks_seed);
 ///     let c = 0 .. 10 => setup_c_in_some_other_way(&caller, c);
-///   }: baz(Origin::Signed(caller))
+///   }: baz(RuntimeOrigin::signed(caller))
 ///
 ///   // this is benchmarking some code that is not a dispatchable.
 ///   populate_a_set {
@@ -174,7 +184,6 @@ macro_rules! whitelist_account {
 ///   });
 /// }
 /// ```
-
 #[macro_export]
 macro_rules! runtime_benchmarks {
 	(
@@ -289,13 +298,13 @@ macro_rules! benchmarks_iter {
 									>:: [< new_call_variant_ $dispatch >] (
 								$($arg),*
 							);
-						let __benchmarked_call_encoded = $crate::frame_support::codec::Encode::encode(
+						let __benchmarked_call_encoded = $crate::parity_scale_codec::Encode::encode(
 							&__call
 						);
 					}: {
 						let __call_decoded = <
 								$pallet::Call::<$runtime $(, $instance )?>
-								as $crate::frame_support::codec::Decode
+								as $crate::parity_scale_codec::Decode
 								>::decode(&mut &__benchmarked_call_encoded[..])
 							.expect("call is encoded above, encoding must be correct");
 						let __origin = $crate::to_origin!($origin $(, $origin_type)?);
@@ -450,7 +459,7 @@ macro_rules! to_origin {
 		$origin.into()
 	};
 	($origin:expr, $origin_type:ty) => {
-		<<$runtime as frame_system::Config>::Origin as From<$origin_type>>::from($origin)
+		<<$runtime as frame_system::Config>::RuntimeOrigin as From<$origin_type>>::from($origin)
 	};
 }
 
@@ -624,9 +633,10 @@ macro_rules! benchmark_backend {
 
 			fn instance(
 				&self,
+				recording: &mut impl $crate::Recording,
 				components: &[($crate::BenchmarkParameter, u32)],
 				verify: bool
-			) -> Result<$crate::Box<dyn FnOnce() -> Result<(), $crate::BenchmarkError>>, $crate::BenchmarkError> {
+			) -> Result<(), $crate::BenchmarkError> {
 				$(
 					// Prepare instance
 					let $param = components.iter()
@@ -640,13 +650,14 @@ macro_rules! benchmark_backend {
 				$( $param_instancer ; )*
 				$( $post )*
 
-				Ok($crate::Box::new(move || -> Result<(), $crate::BenchmarkError> {
-					$eval;
-					if verify {
-						$postcode;
-					}
-					Ok(())
-				}))
+				recording.start();
+                $eval;
+                recording.stop();
+
+				if verify {
+					$postcode;
+				}
+				Ok(())
 			}
 		}
 	};
@@ -694,14 +705,15 @@ macro_rules! selected_benchmark {
 
 			fn instance(
 				&self,
+				recording: &mut impl $crate::Recording,
 				components: &[($crate::BenchmarkParameter, u32)],
 				verify: bool
-			) -> Result<$crate::Box<dyn FnOnce() -> Result<(), $crate::BenchmarkError>>, $crate::BenchmarkError> {
+			) -> Result<(), $crate::BenchmarkError> {
 				match self {
 					$(
 						Self::$bench => <
 							$bench as $crate::BenchmarkingSetup<$runtime $(, $bench_inst)? >
-						>::instance(&$bench, components, verify),
+						>::instance(&$bench, recording, components, verify),
 					)*
 				}
 			}
@@ -741,6 +753,9 @@ macro_rules! impl_benchmark {
 					$crate::BenchmarkMetadata {
 						name: benchmark.as_bytes().to_vec(),
 						components,
+						// TODO: Not supported by V2 syntax as of yet.
+						// https://github.com/paritytech/substrate/issues/13132
+						pov_modes: vec![],
 					}
 				}).collect::<$crate::Vec<_>>()
 			}
@@ -767,18 +782,16 @@ macro_rules! impl_benchmark {
 						$crate::whitelisted_caller::<<$runtime as frame_system::Config>::AccountId>()
 					);
 				whitelist.push(whitelisted_caller_key.into());
+				// Whitelist the transactional layer.
+				let transactional_layer_key = $crate::TrackedStorageKey::new(
+					$crate::frame_support::storage::transactional::TRANSACTION_LEVEL_KEY.into()
+				);
+				whitelist.push(transactional_layer_key);
 				$crate::benchmarking::set_whitelist(whitelist);
 
 				let mut results: $crate::Vec<$crate::BenchmarkResult> = $crate::Vec::new();
 
-				// Always do at least one internal repeat...
-				for _ in 0 .. internal_repeats.max(1) {
-					// Set up the externalities environment for the setup we want to
-					// benchmark.
-					let closure_to_benchmark = <
-						SelectedBenchmark as $crate::BenchmarkingSetup<$runtime $(, $instance)?>
-					>::instance(&selected_benchmark, c, verify)?;
-
+				let on_before_start = || {
 					// Set the block number to at least 1 so events are deposited.
 					if $crate::Zero::is_zero(&frame_system::Pallet::<$runtime>::block_number()) {
 						frame_system::Pallet::<$runtime>::set_block_number(1u32.into());
@@ -790,6 +803,12 @@ macro_rules! impl_benchmark {
 
 					// Reset the read/write counter so we don't count operations in the setup process.
 					$crate::benchmarking::reset_read_write_count();
+				};
+
+				// Always do at least one internal repeat...
+				for _ in 0 .. internal_repeats.max(1) {
+					// Always reset the state after the benchmark.
+					$crate::defer!($crate::benchmarking::wipe_db());
 
 					// Time the extrinsic logic.
 					$crate::log::trace!(
@@ -797,20 +816,12 @@ macro_rules! impl_benchmark {
 						"Start Benchmark: {:?}", c
 					);
 
-					let start_pov = $crate::benchmarking::proof_size();
-					let start_extrinsic = $crate::benchmarking::current_time();
-
-					closure_to_benchmark()?;
-
-					let finish_extrinsic = $crate::benchmarking::current_time();
-					let end_pov = $crate::benchmarking::proof_size();
+					let mut recording = $crate::BenchmarkRecording::new(&on_before_start);
+					<SelectedBenchmark as $crate::BenchmarkingSetup<$runtime>>::instance(&selected_benchmark, &mut recording, c, verify)?;
 
 					// Calculate the diff caused by the benchmark.
-					let elapsed_extrinsic = finish_extrinsic.saturating_sub(start_extrinsic);
-					let diff_pov = match (start_pov, end_pov) {
-						(Some(start), Some(end)) => end.saturating_sub(start),
-						_ => Default::default(),
-					};
+					let elapsed_extrinsic = recording.elapsed_extrinsic().expect("elapsed time should be recorded");
+					let diff_pov = recording.diff_pov().unwrap_or_default();
 
 					// Commit the changes to get proper write count
 					$crate::benchmarking::commit_db();
@@ -907,18 +918,16 @@ macro_rules! impl_benchmark_test {
 					let execute_benchmark = |
 						c: $crate::Vec<($crate::BenchmarkParameter, u32)>
 					| -> Result<(), $crate::BenchmarkError> {
-						// Set up the benchmark, return execution + verification function.
-						let closure_to_verify = <
-							SelectedBenchmark as $crate::BenchmarkingSetup<$runtime, _>
-						>::instance(&selected_benchmark, &c, true)?;
 
-						// Set the block number to at least 1 so events are deposited.
-						if $crate::Zero::is_zero(&frame_system::Pallet::<$runtime>::block_number()) {
-							frame_system::Pallet::<$runtime>::set_block_number(1u32.into());
-						}
+						let on_before_start = || {
+							// Set the block number to at least 1 so events are deposited.
+							if $crate::Zero::is_zero(&frame_system::Pallet::<$runtime>::block_number()) {
+								frame_system::Pallet::<$runtime>::set_block_number(1u32.into());
+							}
+						};
 
 						// Run execution + verification
-						closure_to_verify()?;
+						<SelectedBenchmark as $crate::BenchmarkingSetup<$runtime, _>>::test_instance(&selected_benchmark, &c, &on_before_start)?;
 
 						// Reset the state
 						$crate::benchmarking::wipe_db();
@@ -1175,6 +1184,14 @@ macro_rules! impl_benchmark_test_suite {
 											$crate::str::from_utf8(benchmark_name)
 												.expect("benchmark name is always a valid string!"),
 										);
+									},
+									$crate::BenchmarkError::Weightless => {
+										// This is considered a success condition.
+										$crate::log::error!(
+											"WARNING: benchmark error weightless skipped - {}",
+											$crate::str::from_utf8(benchmark_name)
+												.expect("benchmark name is always a valid string!"),
+										);
 									}
 								}
 							},
@@ -1196,8 +1213,8 @@ pub fn show_benchmark_debug_info(
 	components: &[(BenchmarkParameter, u32)],
 	verify: &bool,
 	error_message: &str,
-) -> sp_runtime::RuntimeString {
-	sp_runtime::format_runtime_string!(
+) -> String {
+	format!(
 		"\n* Pallet: {}\n\
 		* Benchmark: {}\n\
 		* Components: {:?}\n\
@@ -1228,7 +1245,7 @@ pub fn show_benchmark_debug_info(
 /// For example:
 ///
 /// ```
-/// use frame_benchmarking::TrackedStorageKey;
+/// use sp_storage::TrackedStorageKey;
 /// let whitelist: Vec<TrackedStorageKey> = vec![
 ///     // Block Number
 ///     hex_literal::hex!("26aa394eea5630e07c48ae0c9558cef702a5c1b19ab7a04f536c519aca4983ac").to_vec().into(),
@@ -1309,6 +1326,17 @@ macro_rules! add_benchmark {
 							.expect("benchmark name is always a valid string!")
 					);
 					None
+				},
+				Err($crate::BenchmarkError::Weightless) => {
+					$crate::log::error!(
+						"WARNING: benchmark weightless skipped - {}",
+						$crate::str::from_utf8(benchmark)
+							.expect("benchmark name is always a valid string!")
+					);
+					Some(vec![$crate::BenchmarkResult {
+						components: selected_components.clone(),
+						.. Default::default()
+					}])
 				}
 			};
 
@@ -1357,7 +1385,6 @@ macro_rules! cb_add_benchmarks {
 /// ```
 ///
 /// This should match what exists with the `add_benchmark!` macro.
-
 #[macro_export]
 macro_rules! list_benchmark {
 	( $list:ident, $extra:ident, $name:path, $( $location:tt )* ) => (

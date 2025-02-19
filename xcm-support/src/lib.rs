@@ -9,12 +9,15 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(clippy::unused_unit)]
 
-use frame_support::dispatch::{DispatchError, DispatchResult};
-use sp_runtime::traits::{CheckedConversion, Convert};
-use sp_std::{marker::PhantomData, prelude::*};
+use frame_support::{dispatch::DispatchResult, traits::ContainsPair};
+use sp_runtime::{
+	traits::{CheckedConversion, Convert},
+	DispatchError,
+};
+use sp_std::marker::PhantomData;
 
-use xcm::latest::prelude::*;
-use xcm_executor::traits::{FilterAssetLocation, MatchesFungible};
+use xcm::v5::prelude::*;
+use xcm_executor::traits::MatchesFungible;
 
 use orml_traits::{location::Reserve, GetByKey};
 
@@ -29,11 +32,11 @@ mod tests;
 pub struct IsNativeConcrete<CurrencyId, CurrencyIdConvert>(PhantomData<(CurrencyId, CurrencyIdConvert)>);
 impl<CurrencyId, CurrencyIdConvert, Amount> MatchesFungible<Amount> for IsNativeConcrete<CurrencyId, CurrencyIdConvert>
 where
-	CurrencyIdConvert: Convert<MultiLocation, Option<CurrencyId>>,
+	CurrencyIdConvert: Convert<Location, Option<CurrencyId>>,
 	Amount: TryFrom<u128>,
 {
-	fn matches_fungible(a: &MultiAsset) -> Option<Amount> {
-		if let (Fungible(ref amount), Concrete(ref location)) = (&a.fun, &a.id) {
+	fn matches_fungible(a: &Asset) -> Option<Amount> {
+		if let (Fungible(ref amount), AssetId(location)) = (&a.fun, &a.id) {
 			if CurrencyIdConvert::convert(location.clone()).is_some() {
 				return CheckedConversion::checked_from(*amount);
 			}
@@ -42,14 +45,14 @@ where
 	}
 }
 
-/// A `FilterAssetLocation` implementation. Filters multi native assets whose
+/// A `ContainsPair` implementation. Filters multi native assets whose
 /// reserve is same with `origin`.
 pub struct MultiNativeAsset<ReserveProvider>(PhantomData<ReserveProvider>);
-impl<ReserveProvider> FilterAssetLocation for MultiNativeAsset<ReserveProvider>
+impl<ReserveProvider> ContainsPair<Asset, Location> for MultiNativeAsset<ReserveProvider>
 where
 	ReserveProvider: Reserve,
 {
-	fn filter_asset_location(asset: &MultiAsset, origin: &MultiLocation) -> bool {
+	fn contains(asset: &Asset, origin: &Location) -> bool {
 		if let Some(ref reserve) = ReserveProvider::reserve(asset) {
 			if reserve == origin {
 				return true;
@@ -62,27 +65,27 @@ where
 /// Handlers unknown asset deposit and withdraw.
 pub trait UnknownAsset {
 	/// Deposit unknown asset.
-	fn deposit(asset: &MultiAsset, to: &MultiLocation) -> DispatchResult;
+	fn deposit(asset: &Asset, to: &Location) -> DispatchResult;
 
 	/// Withdraw unknown asset.
-	fn withdraw(asset: &MultiAsset, from: &MultiLocation) -> DispatchResult;
+	fn withdraw(asset: &Asset, from: &Location) -> DispatchResult;
 }
 
 const NO_UNKNOWN_ASSET_IMPL: &str = "NoUnknownAssetImpl";
 
 impl UnknownAsset for () {
-	fn deposit(_asset: &MultiAsset, _to: &MultiLocation) -> DispatchResult {
+	fn deposit(_asset: &Asset, _to: &Location) -> DispatchResult {
 		Err(DispatchError::Other(NO_UNKNOWN_ASSET_IMPL))
 	}
-	fn withdraw(_asset: &MultiAsset, _from: &MultiLocation) -> DispatchResult {
+	fn withdraw(_asset: &Asset, _from: &Location) -> DispatchResult {
 		Err(DispatchError::Other(NO_UNKNOWN_ASSET_IMPL))
 	}
 }
 
 // Default implementation for xTokens::MinXcmFee
 pub struct DisabledParachainFee;
-impl GetByKey<MultiLocation, Option<u128>> for DisabledParachainFee {
-	fn get(_key: &MultiLocation) -> Option<u128> {
+impl GetByKey<Location, Option<u128>> for DisabledParachainFee {
+	fn get(_key: &Location) -> Option<u128> {
 		None
 	}
 }

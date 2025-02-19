@@ -4,40 +4,29 @@ on:
   pull_request:
     branches:
       - master
+      - polkadot-**
     paths-ignore:
       - '**/README.md'
   push:
     branches:
       - master
+      - polkadot-**
     paths-ignore:
       - '**/README.md'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  cancel:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Cancel Previous Runs
-        # Only cancel non-master branch runs
-        if: ${{ github.ref != 'refs/heads/master' }}
-        uses: styfle/cancel-workflow-action@0.9.0
-        with:
-          access_token: ${{ github.token }}
   build:
-    runs-on: custom-runner-AWS
+    runs-on: [self-hosted]
     env:
-      SCCACHE_CACHE_SIZE: "50G"
-    needs: cancel
+      SCCACHE_CACHE_SIZE: "60G"
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install toolchain
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: nightly-2022-05-15
-        components: rustfmt
-        target: wasm32-unknown-unknown
-        override: true
-        default: true
+      uses: dtolnay/rust-toolchain@nightly
     - name: Install Wasm toolchain
       run: rustup target add wasm32-unknown-unknown
     - name: Check format
@@ -45,7 +34,8 @@ jobs:
     - name: Install clippy
       run: rustup component add clippy
     - name: Update
-      run: cargo update
+      run: |
+        cargo update
     - name: Run clippy
       run: cargo clippy -- -D warnings
     - name: Check for Wasm

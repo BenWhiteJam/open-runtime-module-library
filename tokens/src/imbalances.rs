@@ -1,7 +1,7 @@
 // wrapping these imbalances in a private module is necessary to ensure absolute
 // privacy of the inner member.
 use crate::{Config, TotalIssuance};
-use frame_support::traits::{Get, Imbalance, SameOrOther, TryDrop};
+use frame_support::traits::{tokens::imbalance::TryMerge, Get, Imbalance, SameOrOther, TryDrop};
 use sp_runtime::traits::{Saturating, Zero};
 use sp_std::{marker, mem, result};
 
@@ -70,7 +70,7 @@ impl<T: Config, GetCurrencyId: Get<T::CurrencyId>> Imbalance<T::Balance> for Pos
 	}
 	fn split(self, amount: T::Balance) -> (Self, Self) {
 		let first = self.0.min(amount);
-		let second = self.0 - first;
+		let second = self.0.saturating_sub(first);
 
 		mem::forget(self);
 		(Self::new(first), Self::new(second))
@@ -92,15 +92,21 @@ impl<T: Config, GetCurrencyId: Get<T::CurrencyId>> Imbalance<T::Balance> for Pos
 		mem::forget((self, other));
 
 		if a > b {
-			SameOrOther::Same(Self::new(a - b))
+			SameOrOther::Same(Self::new(a.saturating_sub(b)))
 		} else if b > a {
-			SameOrOther::Other(NegativeImbalance::new(b - a))
+			SameOrOther::Other(NegativeImbalance::new(b.saturating_sub(a)))
 		} else {
 			SameOrOther::None
 		}
 	}
 	fn peek(&self) -> T::Balance {
 		self.0
+	}
+
+	fn extract(&mut self, amount: T::Balance) -> Self {
+		let new: T::Balance = self.0.min(amount);
+		self.0 -= new;
+		Self::new(new)
 	}
 }
 
@@ -125,7 +131,7 @@ impl<T: Config, GetCurrencyId: Get<T::CurrencyId>> Imbalance<T::Balance> for Neg
 	}
 	fn split(self, amount: T::Balance) -> (Self, Self) {
 		let first = self.0.min(amount);
-		let second = self.0 - first;
+		let second = self.0.saturating_sub(first);
 
 		mem::forget(self);
 		(Self::new(first), Self::new(second))
@@ -147,15 +153,21 @@ impl<T: Config, GetCurrencyId: Get<T::CurrencyId>> Imbalance<T::Balance> for Neg
 		mem::forget((self, other));
 
 		if a > b {
-			SameOrOther::Same(Self::new(a - b))
+			SameOrOther::Same(Self::new(a.saturating_sub(b)))
 		} else if b > a {
-			SameOrOther::Other(PositiveImbalance::new(b - a))
+			SameOrOther::Other(PositiveImbalance::new(b.saturating_sub(a)))
 		} else {
 			SameOrOther::None
 		}
 	}
 	fn peek(&self) -> T::Balance {
 		self.0
+	}
+
+	fn extract(&mut self, amount: T::Balance) -> Self {
+		let new: T::Balance = self.0.min(amount);
+		self.0 -= new;
+		Self::new(new)
 	}
 }
 
@@ -170,5 +182,16 @@ impl<T: Config, GetCurrencyId: Get<T::CurrencyId>> Drop for NegativeImbalance<T,
 	/// Basic drop handler will just square up the total issuance.
 	fn drop(&mut self) {
 		TotalIssuance::<T>::mutate(GetCurrencyId::get(), |v| *v = v.saturating_sub(self.0));
+	}
+}
+
+impl<T: Config, GetCurrencyId: Get<T::CurrencyId>> TryMerge for PositiveImbalance<T, GetCurrencyId> {
+	fn try_merge(self, other: Self) -> Result<Self, (Self, Self)> {
+		Ok(self.merge(other))
+	}
+}
+impl<T: Config, GetCurrencyId: Get<T::CurrencyId>> TryMerge for NegativeImbalance<T, GetCurrencyId> {
+	fn try_merge(self, other: Self) -> Result<Self, (Self, Self)> {
+		Ok(self.merge(other))
 	}
 }
